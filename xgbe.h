@@ -55,6 +55,14 @@
 #include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 
+#define DBUG 1
+
+#ifdef DEBUG
+#define DEBUG_MSG(...) printk(__VA_ARGS__)
+#else
+#define DEBUG_MSG(...)
+#endif
+
 #define USE_IXGBE_METHOD
  
 #define BAR_0		0
@@ -64,6 +72,72 @@
 #define XGBE_ETHERNET_DEVICE(device_id) {\
      PCI_DEVICE(PCI_VENDOR_ID_XILINX, device_id)}
 
+#define E1000_MAX_INTR			10
+
+/*
+ * Count for polling __E1000_RESET condition every 10-20msec.
+ */
+#define E1000_CHECK_RESET_COUNT	50
+
+/* TX/RX descriptor defines */
+#define E1000_DEFAULT_TXD		256
+#define E1000_MAX_TXD			256
+#define E1000_MIN_TXD			48
+#define E1000_MAX_82544_TXD		4096
+
+#define E1000_DEFAULT_RXD		256
+#define E1000_MAX_RXD			256
+#define E1000_MIN_RXD			48
+#define E1000_MAX_82544_RXD		4096
+
+#define E1000_MIN_ITR_USECS		10 /* 100000 irq/sec */
+#define E1000_MAX_ITR_USECS		10000 /* 100    irq/sec */
+
+/* this is the size past which hardware will drop packets when setting LPE=0 */
+#define MAXIMUM_ETHERNET_VLAN_SIZE	1600
+
+/* Supported Rx Buffer Sizes */
+#define E1000_RXBUFFER_128		128    /* Used for packet split */
+#define E1000_RXBUFFER_256		256    /* Used for packet split */
+#define E1000_RXBUFFER_512		512
+#define E1000_RXBUFFER_1024		1024
+#define E1000_RXBUFFER_2048		2048
+#define E1000_RXBUFFER_4096		4096
+#define E1000_RXBUFFER_8192		8192
+#define E1000_RXBUFFER_16384		16384
+
+/* SmartSpeed delimiters */
+#define E1000_SMARTSPEED_DOWNSHIFT	3
+#define E1000_SMARTSPEED_MAX		15
+
+/* Packet Buffer allocations */
+#define E1000_PBA_BYTES_SHIFT		0xA
+#define E1000_TX_HEAD_ADDR_SHIFT	7
+#define E1000_PBA_TX_MASK		0xFFFF0000
+
+/* Flow Control Watermarks */
+#define E1000_FC_HIGH_DIFF	0x1638 /* High: 5688 bytes below Rx FIFO size */
+#define E1000_FC_LOW_DIFF	0x1640 /* Low:  5696 bytes below Rx FIFO size */
+
+#define E1000_FC_PAUSE_TIME	0xFFFF /* pause for the max or until send xon */
+
+/* How many Tx Descriptors do we need to call netif_wake_queue ? */
+#define E1000_TX_QUEUE_WAKE	16
+/* How many Rx Buffers do we bundle into one write to the hardware ? */
+#define E1000_RX_BUFFER_WRITE	16 /* Must be power of 2 */
+
+#define AUTO_ALL_MODES		0
+#define E1000_EEPROM_82544_APM	0x0004
+#define E1000_EEPROM_APME	0x0400
+
+#ifndef E1000_MASTER_SLAVE
+/* Switch to override PHY master/slave setting */
+#define E1000_MASTER_SLAVE	e1000_ms_hw_default
+#endif
+
+#define E1000_MNG_VLAN_NONE	(-1)
+
+
 enum e1000_state_t {
 	__E1000_TESTING,
 	__E1000_RESETTING,
@@ -71,6 +145,87 @@ enum e1000_state_t {
 	__E1000_DISABLED
 };
 
+#define E1000_DESC_UNUSED(R)						\
+({									\
+	unsigned int clean = smp_load_acquire(&(R)->next_to_clean);	\
+	unsigned int use = READ_ONCE((R)->next_to_use);			\
+	(clean > use ? 0 : (R)->count) + clean - use - 1;		\
+})
+
+#define E1000_RX_DESC_EXT(R, i)						\
+	(&(((union e1000_rx_desc_extended *)((R).desc))[i]))
+#define E1000_GET_DESC(R, i, type)	(&(((struct type *)((R).desc))[i]))
+#define E1000_RX_DESC(R, i)		E1000_GET_DESC(R, i, e1000_rx_desc)
+#define E1000_TX_DESC(R, i)		E1000_GET_DESC(R, i, e1000_tx_desc)
+#define E1000_CONTEXT_DESC(R, i)	E1000_GET_DESC(R, i, e1000_context_desc)
+
+
+/* wrapper around a pointer to a socket buffer,
+ * so a DMA handle can be stored along with the buffer
+ */
+struct e1000_tx_buffer {
+	struct sk_buff *skb;
+	dma_addr_t dma;
+	unsigned long time_stamp;
+	u16 length;
+	u16 next_to_watch;
+	bool mapped_as_page;
+	unsigned short segs;
+	unsigned int bytecount;
+};
+
+struct e1000_rx_buffer {
+	union {
+		struct page *page; /* jumbo: alloc_page */
+		u8 *data; /* else, netdev_alloc_frag */
+	} rxbuf;
+	dma_addr_t dma;
+};
+
+struct e1000_tx_ring {
+	/* pointer to the descriptor ring memory */
+	void *desc;
+	/* physical address of the descriptor ring */
+	dma_addr_t dma;
+	/* length of descriptor ring in bytes */
+	unsigned int size;
+	/* number of descriptors in the ring */
+	unsigned int count;
+	/* next descriptor to associate a buffer with */
+	unsigned int next_to_use;
+	/* next descriptor to check for DD status bit */
+	unsigned int next_to_clean;
+	/* array of buffer information structs */
+	struct e1000_tx_buffer *buffer_info;
+
+	u16 tdh;
+	u16 tdt;
+	bool last_tx_tso;
+};
+
+struct e1000_rx_ring {
+	/* pointer to the descriptor ring memory */
+	void *desc;
+	/* physical address of the descriptor ring */
+	dma_addr_t dma;
+	/* length of descriptor ring in bytes */
+	unsigned int size;
+	/* number of descriptors in the ring */
+	unsigned int count;
+	/* next descriptor to associate a buffer with */
+	unsigned int next_to_use;
+	/* next descriptor to check for DD status bit */
+	unsigned int next_to_clean;
+	/* array of buffer information structs */
+	struct e1000_rx_buffer *buffer_info;
+	struct sk_buff *rx_skb_top;
+
+	/* cpu for rx queue */
+	int cpu;
+
+	u16 rdh;
+	u16 rdt;
+};
 
 /* board specific private data structure */
 
